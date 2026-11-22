@@ -1,0 +1,177 @@
+name: Disposable VHDX rehearsal
+on: workflow_dispatch
+permissions: {}
+# Runs only on manual dispatch; all file paths and all inputs are synthetic, with no event payload in shell commands.
+
+jobs:
+  fixture:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Build a synthetic ext4 disk with allocated zero blocks
+        run: |
+          if ! command -v qemu-img; then
+            sudo apt-get update -q
+            sudo apt-get install -yq --no-install-recommends qemu-utils
+          fi
+          mkdir fixture
+          truncate -s 192M ext4.raw
+          mkfs.ext4 -F -E lazy_itable_init=0,lazy_journal_init=0 ext4.raw
+          dd if=/dev/urandom of=sample.bin bs=1M count=8 status=none
+          debugfs -w -R 'write sample.bin /sample.bin' ext4.raw
+          e2fsck -fn ext4.raw
+          sha256sum ext4.raw > fixture/raw.sha256
+          qemu-img convert -f raw -O vhdx -S 0 -o block_size=2097152 ext4.raw fixture/original.vhdx
+          qemu-img info fixture/original.vhdx
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: fixture
+          path: fixture
+          if-no-files-found: error
+          retention-days: 1
+
+  compact:
+    needs: fixture
+    runs-on: windows-2025
+    timeout-minutes: 8
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fixture
+          path: ${{ runner.temp }}/fixture
+      - name: Compact only a detached copy using DiskPart on NTFS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          $work = Join-Path $env:RUNNER_TEMP 'compact'
+          $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($work))
+          if ($drive.DriveFormat -ne 'NTFS') { throw 'Not NTFS' }
+          $reserve = Join-Path $env:RUNNER_TEMP 'fixture/original.vhdx'
+          New-Item -ItemType Directory $work | Out-Null
+          $candidate = Join-Path $work 'candidate.vhdx'
+          $hash = (Get-FileHash -LiteralPath $reserve).Hash
+          $before = (Get-Item -LiteralPath $reserve).Length
+          Copy-Item -LiteralPath $reserve -Destination $candidate
+          if ((Get-FileHash -LiteralPath $candidate).Hash -ne $hash) { throw 'Copy mismatched' }
+          $script = Join-Path $work 'diskpart.txt'
+          @("select vdisk file=`"$candidate`"", 'detail vdisk', 'compact vdisk', 'detail vdisk') |
+            Set-Content -LiteralPath $script -Encoding ascii
+          & "$env:SystemRoot/System32/diskpart.exe" /s $script
+          if ($LASTEXITCODE -ne 0) { throw "DiskPart exit: $LASTEXITCODE" }
+          $entry = Get-Item -LiteralPath $candidate
+          $flags = [IO.FileAttributes]::SparseFile -bor [IO.FileAttributes]::Compressed
+          if (($entry.Attributes -band $flags) -ne 0) { throw 'Unexpected NTFS sparse/compressed flag' }
+          $after = $entry.Length
+          if ($after -ge $before) { throw 'No reclaimed space' }
+          if ((Get-FileHash -LiteralPath $reserve).Hash -ne $hash) { throw 'Reserve changed' }
+          $sw.Stop()
+          "NTFS candidate: $before -> $after bytes; reclaimed=$($before - $after); elapsed_ms=$($sw.ElapsedMilliseconds)"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: candidate
+          path: ${{ runner.temp }}/compact/candidate.vhdx
+          if-no-files-found: error
+          retention-days: 1
+
+  verify-ext4:
+    needs: compact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fixture
+          path: fixture
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate
+          path: candidate
+      - name: Check the compacted filesystem offline and compare every virtual byte
+        shell: bash
+        run: |
+          if ! command -v qemu-img; then
+            sudo apt-get update -q
+            sudo apt-get install -yq --no-install-recommends qemu-utils
+          fi
+          qemu-img convert -f vhdx -O raw candidate/candidate.vhdx ext4.raw
+          e2fsck -fn ext4.raw
+          sha256sum -c fixture/raw.sha256
+          sha256sum candidate/candidate.vhdx > ext4-verified.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: verified-hash
+          path: ext4-verified.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  rollback:
+    needs: verify-ext4
+    runs-on: windows-2025
+    timeout-minutes: 8
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: fixture
+          path: ${{ runner.temp }}/fixture
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: candidate
+          path: ${{ runner.temp }}/candidate
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: verified-hash
+          path: ${{ runner.temp }}/verified
+      - name: Reject a damaged copy, swap a verified copy, and roll back on NTFS
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $work = Join-Path $env:RUNNER_TEMP 'scratch'
+          $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($work))
+          if ($drive.DriveFormat -ne 'NTFS') { throw 'Not NTFS' }
+          $reserve = Join-Path $env:RUNNER_TEMP 'fixture/original.vhdx'
+          $candidate = Join-Path $env:RUNNER_TEMP 'candidate/candidate.vhdx'
+          $expected = ((Get-Content (Join-Path $env:RUNNER_TEMP 'verified/ext4-verified.sha256')) -split ' ')[0]
+          $baseline = (Get-FileHash -LiteralPath $reserve).Hash
+          $baselineLength = (Get-Item -LiteralPath $reserve).Length
+          New-Item -ItemType Directory $work | Out-Null
+          $active = Join-Path $work 'simulated-active.vhdx'
+          $next = Join-Path $work 'next.vhdx'
+          $failed = Join-Path $work 'failed.vhdx'
+          Copy-Item -LiteralPath $reserve -Destination $active
+          $acl = Get-Acl -LiteralPath $active
+          function Stage($path, $sha) {
+            if ((Get-FileHash -LiteralPath $path).Hash -ne $sha) { return $false }
+            Copy-Item -LiteralPath $path -Destination $next
+            Set-Acl -LiteralPath $next -AclObject $acl
+            if ((Get-FileHash -LiteralPath $next).Hash -ne $sha) { throw 'Staged hash changed' }
+            return $true
+          }
+          function Check-Active($sha) {
+            if ((Get-FileHash -LiteralPath $active).Hash -ne $sha) { throw 'Active hash changed' }
+            if ((Get-Acl -LiteralPath $active).Sddl -ne $acl.Sddl) { throw 'Active ACL changed' }
+          }
+          $damaged = Join-Path $work 'damaged.vhdx'
+          Copy-Item -LiteralPath $candidate -Destination $damaged
+          $file = [IO.File]::OpenWrite($damaged)
+          try { $file.SetLength($file.Length - 4096) } finally { $file.Dispose() }
+          if (Stage $damaged $expected) { throw 'Accepted damaged candidate' }
+          Check-Active $baseline
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          if (-not (Stage $candidate $expected)) { throw 'Refused verified candidate' }
+          Remove-Item -LiteralPath $active
+          Move-Item -LiteralPath $next -Destination $active
+          Check-Active $expected
+          "Swap passed: $($sw.ElapsedMilliseconds) ms. Injecting a simulated startup failure."
+          $sw.Restart()
+          if (-not (Stage $reserve $baseline)) { throw 'Refused reserve' }
+          Move-Item -LiteralPath $active -Destination $failed
+          Move-Item -LiteralPath $next -Destination $active
+          Check-Active $baseline
+          if ((Get-Item -LiteralPath $active).Length -ne $baselineLength) { throw 'Restored length changed' }
+          if ((Get-FileHash -LiteralPath $reserve).Hash -ne $baseline) { throw 'Reserve changed' }
+          if ((Get-FileHash -LiteralPath $failed).Hash -ne $expected) { throw 'Failed candidate changed' }
+          "Rollback passed: $($sw.ElapsedMilliseconds) ms, $baselineLength bytes restored, SHA-256 and ACL verified."
