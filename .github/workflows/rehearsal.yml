@@ -140,37 +140,54 @@ jobs:
           New-Item -ItemType Directory $work | Out-Null
           $active = Join-Path $work 'simulated-active.vhdx'
           $next = Join-Path $work 'next.vhdx'
-          $failed = Join-Path $work 'failed.vhdx'
+          $failed = Join-Path $env:RUNNER_TEMP 'candidate/failed.vhdx'
           Copy-Item -LiteralPath $reserve -Destination $active
-          $acl = Get-Acl -LiteralPath $active
+          $initialAcl = Get-Acl -LiteralPath $active
+          $initialAcl.SetAccessRuleProtection($true, $true)
+          Set-Acl -LiteralPath $active -AclObject $initialAcl
+          if (-not (Get-Acl -LiteralPath $active).AreAccessRulesProtected) { throw 'ACL fixture is not protected' }
+          $sddl = (Get-Acl -LiteralPath $active).Sddl
+          $aclFile = Join-Path $work 'active-acl.txt'
+          Push-Location $work
+          try {
+            & icacls.exe ([IO.Path]::GetFileName($active)) /save $aclFile /q
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to save ACL' }
+          } finally { Pop-Location }
           function Stage($path, $sha) {
             if ((Get-FileHash -LiteralPath $path).Hash -ne $sha) { return $false }
             Copy-Item -LiteralPath $path -Destination $next
-            Set-Acl -LiteralPath $next -AclObject $acl
             if ((Get-FileHash -LiteralPath $next).Hash -ne $sha) { throw 'Staged hash changed' }
             return $true
           }
-          function Check-Active($sha) {
-            if ((Get-FileHash -LiteralPath $active).Hash -ne $sha) { throw 'Active hash changed' }
-            if ((Get-Acl -LiteralPath $active).Sddl -ne $acl.Sddl) { throw 'Active ACL changed' }
+          function Restore-ACL {
+            & icacls.exe $work /restore $aclFile /q
+            if ($LASTEXITCODE -ne 0) { throw 'Failed to restore ACL' }
+          }
+          function Check-Active($sha, $phase) {
+            if ((Get-FileHash -LiteralPath $active).Hash -ne $sha) { throw "$phase hash changed" }
+            $actual = (Get-Acl -LiteralPath $active).Sddl
+            if ($actual -ne $sddl) { throw "$phase ACL changed; expected=$sddl; found=$actual" }
           }
           $damaged = Join-Path $work 'damaged.vhdx'
           Copy-Item -LiteralPath $candidate -Destination $damaged
           $file = [IO.File]::OpenWrite($damaged)
           try { $file.SetLength($file.Length - 4096) } finally { $file.Dispose() }
           if (Stage $damaged $expected) { throw 'Accepted damaged candidate' }
-          Check-Active $baseline
+          Check-Active $baseline 'rejected damaged copy'
           $sw = [Diagnostics.Stopwatch]::StartNew()
           if (-not (Stage $candidate $expected)) { throw 'Refused verified candidate' }
           Remove-Item -LiteralPath $active
           Move-Item -LiteralPath $next -Destination $active
-          Check-Active $expected
+          if ((Get-Acl -LiteralPath $active).Sddl -eq $sddl) { throw 'ACL control was not different before restore' }
+          Restore-ACL
+          Check-Active $expected 'swap'
           "Swap passed: $($sw.ElapsedMilliseconds) ms. Injecting a simulated startup failure."
           $sw.Restart()
           if (-not (Stage $reserve $baseline)) { throw 'Refused reserve' }
           Move-Item -LiteralPath $active -Destination $failed
           Move-Item -LiteralPath $next -Destination $active
-          Check-Active $baseline
+          Restore-ACL
+          Check-Active $baseline 'rollback'
           if ((Get-Item -LiteralPath $active).Length -ne $baselineLength) { throw 'Restored length changed' }
           if ((Get-FileHash -LiteralPath $reserve).Hash -ne $baseline) { throw 'Reserve changed' }
           if ((Get-FileHash -LiteralPath $failed).Hash -ne $expected) { throw 'Failed candidate changed' }
