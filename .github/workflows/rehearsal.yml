@@ -125,13 +125,29 @@ jobs:
         with:
           name: verified-hash
           path: ${{ runner.temp }}/verified
-      - name: Reject a damaged copy, swap a verified copy, and roll back on NTFS
+      - name: Reject a damaged copy, swap and roll back across NTFS volumes under low space
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $work = Join-Path $env:RUNNER_TEMP 'scratch'
-          $drive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($work))
-          if ($drive.DriveFormat -ne 'NTFS') { throw 'Not NTFS' }
+          $hostWork = Join-Path $env:RUNNER_TEMP 'scratch'
+          New-Item -ItemType Directory -Path $hostWork | Out-Null
+          $outer = Join-Path $hostWork 'space-limited-host.vhdx'
+          $diskpart = Join-Path $env:SystemRoot 'System32/diskpart.exe'
+          $script = Join-Path $hostWork 'diskpart.txt'
+          $used = @([IO.DriveInfo]::GetDrives() | ForEach-Object { $_.Name.Substring(0, 1) })
+          $letter = @('R','S','T','U','V','W','X','Y','Z') | Where-Object { $_ -notin $used } | Select-Object -First 1
+          if (-not $letter) { throw 'No free drive letter' }
+          $label = 'Disposable-' + ([guid]::NewGuid().ToString('N').Substring(0, 8))
+          @("create vdisk file=`"$outer`" maximum=216 type=expandable", "select vdisk file=`"$outer`"", 'attach vdisk',
+            'create partition primary', "format fs=ntfs label=$label quick", "assign letter=$letter") |
+            Set-Content -LiteralPath $script -Encoding ascii
+          & $diskpart /s $script
+          if ($LASTEXITCODE -ne 0) { throw "Could not create scratch volume: $LASTEXITCODE" }
+          $volume = "{0}:\" -f $letter
+          $drive = [IO.DriveInfo]::new($volume)
+          if ($drive.DriveFormat -ne 'NTFS' -or $drive.VolumeLabel -ne $label) { throw 'Wrong scratch volume' }
+          if ([IO.Path]::GetPathRoot($hostWork) -eq $volume) { throw 'Need two volumes' }
+          $work = Join-Path $volume 'active'
           $reserve = Join-Path $env:RUNNER_TEMP 'fixture/original.vhdx'
           $candidate = Join-Path $env:RUNNER_TEMP 'candidate/candidate.vhdx'
           $expected = ((Get-Content (Join-Path $env:RUNNER_TEMP 'verified/ext4-verified.sha256')) -split ' ')[0]
@@ -147,7 +163,7 @@ jobs:
           Set-Acl -LiteralPath $active -AclObject $initialAcl
           if (-not (Get-Acl -LiteralPath $active).AreAccessRulesProtected) { throw 'ACL fixture is not protected' }
           $sddl = (Get-Acl -LiteralPath $active).Sddl
-          $aclFile = Join-Path $work 'active-acl.txt'
+          $aclFile = Join-Path $hostWork 'active-acl.txt'
           Push-Location $work
           try {
             & icacls.exe ([IO.Path]::GetFileName($active)) /save $aclFile /q
@@ -168,23 +184,44 @@ jobs:
             $actual = (Get-Acl -LiteralPath $active).Sddl
             if ($actual -ne $sddl) { throw "$phase ACL changed; expected=$sddl; found=$actual" }
           }
-          $damaged = Join-Path $work 'damaged.vhdx'
+          $damaged = Join-Path $hostWork 'damaged.vhdx'
           Copy-Item -LiteralPath $candidate -Destination $damaged
           $file = [IO.File]::OpenWrite($damaged)
           try { $file.SetLength($file.Length - 4096) } finally { $file.Dispose() }
           if (Stage $damaged $expected) { throw 'Accepted damaged candidate' }
           Check-Active $baseline 'rejected damaged copy'
+          $candidateLength = (Get-Item -LiteralPath $candidate).Length
+          $freeWithOriginal = $drive.AvailableFreeSpace
+          if ($freeWithOriginal -ge $candidateLength) { throw 'Fixture must not fit original and candidate together' }
+          "Swap budget: $freeWithOriginal bytes free with original present; candidate needs $candidateLength bytes."
           $sw = [Diagnostics.Stopwatch]::StartNew()
-          if (-not (Stage $candidate $expected)) { throw 'Refused verified candidate' }
+          Check-Active $baseline 'before releasing original slot'
+          if ((Get-FileHash -LiteralPath $reserve).Hash -ne $baseline) { throw 'Reserve changed before swap' }
+          if ((Get-FileHash -LiteralPath $candidate).Hash -ne $expected) { throw 'Candidate changed before swap' }
+          $original = Get-Item -LiteralPath $active
+          $flags = [IO.FileAttributes]::SparseFile -bor [IO.FileAttributes]::Compressed
+          if (($original.Attributes -band $flags) -ne 0 -or $original.Length -ne $baselineLength) { throw 'Original allocation assumption failed' }
+          if (($freeWithOriginal + $original.Length) -lt [Math]::Max($candidateLength, $baselineLength)) { throw 'Cannot predict safe swap/restore budget' }
           Remove-Item -LiteralPath $active
+          if ($drive.AvailableFreeSpace -lt [Math]::Max($candidateLength, $baselineLength)) { throw 'Swap/restore cannot fit' }
+          if (-not (Stage $candidate $expected)) { throw 'Refused verified candidate' }
           Move-Item -LiteralPath $next -Destination $active
           if ((Get-Acl -LiteralPath $active).Sddl -eq $sddl) { throw 'ACL control was not different before restore' }
           Restore-ACL
           Check-Active $expected 'swap'
           "Swap passed: $($sw.ElapsedMilliseconds) ms. Injecting a simulated startup failure."
           $sw.Restart()
+          $freeWithCandidate = $drive.AvailableFreeSpace
+          if ($freeWithCandidate -ge $baselineLength) { throw 'Fixture must not fit candidate and reserve together' }
+          "Rollback budget: $freeWithCandidate bytes free with candidate present; original needs $baselineLength bytes."
+          if ((Get-FileHash -LiteralPath $reserve).Hash -ne $baseline) { throw 'Reserve changed before rollback' }
+          $failureDrive = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($failed))
+          if ($failureDrive.AvailableFreeSpace -lt $candidateLength) { throw 'No room to preserve failed candidate' }
+          Copy-Item -LiteralPath $active -Destination $failed
+          if ((Get-FileHash -LiteralPath $failed).Hash -ne $expected) { throw 'Failed candidate could not be preserved' }
+          Remove-Item -LiteralPath $active
+          if ($drive.AvailableFreeSpace -lt $baselineLength) { throw 'Restore cannot fit' }
           if (-not (Stage $reserve $baseline)) { throw 'Refused reserve' }
-          Move-Item -LiteralPath $active -Destination $failed
           Move-Item -LiteralPath $next -Destination $active
           Restore-ACL
           Check-Active $baseline 'rollback'
@@ -192,3 +229,16 @@ jobs:
           if ((Get-FileHash -LiteralPath $reserve).Hash -ne $baseline) { throw 'Reserve changed' }
           if ((Get-FileHash -LiteralPath $failed).Hash -ne $expected) { throw 'Failed candidate changed' }
           "Rollback passed: $($sw.ElapsedMilliseconds) ms, $baselineLength bytes restored, SHA-256 and ACL verified."
+      - name: Detach the disposable volume
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $hostWork = Join-Path $env:RUNNER_TEMP 'scratch'
+          $outer = Join-Path $hostWork 'space-limited-host.vhdx'
+          if (Test-Path -LiteralPath $outer) {
+            $script = Join-Path $hostWork 'detach.txt'
+            @("select vdisk file=`"$outer`"", 'detach vdisk') | Set-Content -LiteralPath $script -Encoding ascii
+            & "$env:SystemRoot/System32/diskpart.exe" /s $script
+            if ($LASTEXITCODE -ne 0) { throw "DiskPart detach: $LASTEXITCODE" }
+          }
